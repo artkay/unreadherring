@@ -264,47 +264,21 @@ defmodule UnreadHerringWeb.DashboardLiveTest do
     refute html =~ "mail.google.com/mail/u/0/"
   end
 
-  test "trash is gated by a confirm modal; cancel closes it without acting", %{conn: conn} do
+  test "mark read is gated by a confirm modal; cancel closes it without acting", %{conn: conn} do
     UnreadHerring.Scanner.subscribe()
     {:ok, view, _html} = live(conn, "/")
     send(view.pid, {:done, fixture_tree()})
 
     refute has_element?(view, "#action-confirm-modal")
 
-    view |> element(~s|button[phx-value-action="trash"]|) |> render_click()
+    view |> element(~s|button[phx-value-action="mark_read"]|) |> render_click()
     assert has_element?(view, "#action-confirm-modal")
-    assert render(view) =~ "recoverable in Gmail for 30 days"
+    assert render(view) =~ "Are you sure?"
     refute_receive {:action_done, _, _}, 150
 
     view |> element(~s|#action-confirm-modal button[phx-click="cancel_action"]|) |> render_click()
     refute has_element?(view, "#action-confirm-modal")
     refute_receive {:action_done, _, _}, 150
-  end
-
-  test "confirming trash applies the action and reports it", %{conn: conn} do
-    UnreadHerring.Scanner.subscribe()
-    {:ok, view, _html} = live(conn, "/")
-    send(view.pid, {:done, fixture_tree()})
-
-    view |> element(~s|button[phx-value-action="trash"]|) |> render_click()
-
-    # Acting on the whole scan result (root) takes a second confirmation
-    view
-    |> element(~s|#action-confirm-modal button[phx-click="confirm_action"]|)
-    |> render_click()
-
-    assert render(view) =~ "Final confirmation"
-    refute_receive {:action_done, _, _}, 150
-
-    view
-    |> element(~s|#action-confirm-modal button[phx-click="confirm_action"]|)
-    |> render_click()
-
-    # The stubbed mailbox is empty for the action's id listing, so the
-    # action completes having modified zero messages.
-    assert_receive {:action_done, :trash, 0}, 2000
-    assert render(view) =~ "Moved 0 messages to trash."
-    refute has_element?(view, "#action-confirm-modal")
   end
 
   test "drilled-down (non-root) actions need only one confirmation", %{conn: conn} do
@@ -316,47 +290,31 @@ defmodule UnreadHerringWeb.DashboardLiveTest do
     |> element(~s|#sunburst path[phx-value-node-id="root/news.com"]|)
     |> render_click()
 
-    view |> element(~s|button[phx-value-action="trash"]|) |> render_click()
-
-    view
-    |> element(~s|#action-confirm-modal button[phx-click="confirm_action"]|)
-    |> render_click()
-
-    assert_receive {:action_done, :trash, 0}, 2000
-    refute has_element?(view, "#action-confirm-modal")
-  end
-
-  test "undo reverses the last action and clears the acted state", %{conn: conn} do
-    UnreadHerring.Scanner.subscribe()
-    {:ok, view, _html} = live(conn, "/")
-    send(view.pid, {:done, fixture_tree()})
-
-    refute has_element?(view, "#undo-bar")
-
-    # Act on a drilled-down wedge (single confirmation)
-    view
-    |> element(~s|#sunburst path[phx-value-node-id="root/news.com"]|)
-    |> render_click()
-
     view |> element(~s|button[phx-value-action="mark_read"]|) |> render_click()
 
     view
     |> element(~s|#action-confirm-modal button[phx-click="confirm_action"]|)
     |> render_click()
 
+    # The stubbed mailbox is empty for the action's id listing, so the
+    # action completes having modified zero messages.
     assert_receive {:action_done, :mark_read, 0}, 2000
-    assert has_element?(view, "#undo-bar")
-    assert render(view) =~ "Marked read: 0 messages in &quot;news.com&quot;"
-    assert has_element?(view, ~s|#sunburst path[class*="grayscale"]|)
+    assert render(view) =~ "Marked 0 messages as read."
+    refute has_element?(view, "#action-confirm-modal")
+  end
 
-    view |> element(~s|#undo-bar button[phx-click="undo"]|) |> render_click()
+  test "trash and archive are gone: mark read is the only action", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/")
+    send(view.pid, {:done, fixture_tree()})
 
-    assert_receive {:undo_done, :mark_read, 0}, 2000
-    html = render(view)
-    assert html =~ "Undo complete"
-    refute has_element?(view, "#undo-bar")
-    refute has_element?(view, ~s|#sunburst path[class*="grayscale"]|)
-    refute has_element?(view, ~s|button[phx-value-action="mark_read"][disabled]|)
+    assert has_element?(view, ~s|button[phx-value-action="mark_read"]|)
+    refute has_element?(view, ~s|button[phx-value-action="trash"]|)
+    refute has_element?(view, ~s|button[phx-value-action="archive"]|)
+
+    # Forcing the events does nothing either
+    render_click(view, "request_action", %{"action" => "trash"})
+    render_click(view, "request_action", %{"action" => "archive"})
+    refute has_element?(view, "#action-confirm-modal")
   end
 
   test "logout is confirmed, then deletes the token and shows the connect hero", %{conn: conn} do
@@ -390,12 +348,12 @@ defmodule UnreadHerringWeb.DashboardLiveTest do
     assert UnreadHerring.Scanner.last_result() == :empty
   end
 
-  test "mark read and archive are confirmed too, and the acted bucket grays out", %{conn: conn} do
+  test "root-level mark read takes a double confirmation and grays the bucket", %{conn: conn} do
     UnreadHerring.Scanner.subscribe()
     {:ok, view, _html} = live(conn, "/")
     send(view.pid, {:done, fixture_tree()})
 
-    # Mark read no longer fires immediately: it opens the confirm modal
+    # Mark read opens the confirm modal rather than firing immediately
     view |> element(~s|button[phx-value-action="mark_read"]|) |> render_click()
     assert has_element?(view, "#action-confirm-modal")
     assert render(view) =~ "Mark as read?"
@@ -417,15 +375,14 @@ defmodule UnreadHerringWeb.DashboardLiveTest do
     assert_receive {:action_done, :mark_read, 0}, 2000
     html = render(view)
 
-    # Acted state: badge on the focused card, buttons disabled, wedges
+    # Acted state: badge on the focused card, button disabled, wedges
     # grayed (root was acted on, so all descendant wedges are covered)
     assert html =~ "Marked read"
     assert has_element?(view, ~s|button[phx-value-action="mark_read"][disabled]|)
-    assert has_element?(view, ~s|button[phx-value-action="trash"][disabled]|)
     assert has_element?(view, ~s|#sunburst path[class*="grayscale"]|)
 
-    # Clicking an action again is a no-op (no new modal)
-    render_click(view, "request_action", %{"action" => "archive"})
+    # Clicking the action again is a no-op (no new modal)
+    render_click(view, "request_action", %{"action" => "mark_read"})
     refute has_element?(view, "#action-confirm-modal")
 
     # A fresh scan clears the acted state
@@ -434,17 +391,29 @@ defmodule UnreadHerringWeb.DashboardLiveTest do
     refute has_element?(view, ~s|button[phx-value-action="mark_read"][disabled]|)
   end
 
+  test "a dropped-messages scan shows the incomplete warning", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/")
+
+    refute has_element?(view, "#scan-incomplete-notice")
+    send(view.pid, {:scan_incomplete, 120, 10_000})
+
+    assert has_element?(view, "#scan-incomplete-notice")
+    html = render(view)
+    assert html =~ "120 of 10000 messages"
+    assert html =~ "quota"
+  end
+
   test "a rescan completing while the modal is open keeps the captured target", %{conn: conn} do
     UnreadHerring.Scanner.subscribe()
     {:ok, view, _html} = live(conn, "/")
     send(view.pid, {:done, fixture_tree()})
 
-    # Drill into news.com, open the trash modal there
+    # Drill into news.com, open the confirm modal there
     view
     |> element(~s|#sunburst path[phx-value-node-id="root/news.com"]|)
     |> render_click()
 
-    view |> element(~s|button[phx-value-action="trash"]|) |> render_click()
+    view |> element(~s|button[phx-value-action="mark_read"]|) |> render_click()
     assert has_element?(view, "#action-confirm-modal")
 
     # A scan completes mid-confirmation and re-roots the chart: the modal
@@ -467,10 +436,10 @@ defmodule UnreadHerringWeb.DashboardLiveTest do
     |> render_click()
 
     assert render(view) =~ "cannot be searched"
-    refute has_element?(view, ~s|button[phx-value-action="trash"]|)
+    refute has_element?(view, ~s|button[phx-value-action="mark_read"]|)
 
     # request_action without a query must be a no-op even if forced
-    render_click(view, "request_action", %{"action" => "trash"})
+    render_click(view, "request_action", %{"action" => "mark_read"})
     refute has_element?(view, "#action-confirm-modal")
   end
 

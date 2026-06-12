@@ -19,28 +19,24 @@ defmodule UnreadHerring.Scanner do
     Spawns a supervised task under `UnreadHerring.Tasks` that lists ids,
     fetches metadata, aggregates, broadcasting over PubSub topic "scan":
       `{:scan_started, total_estimate}`
-      `{:progress, n, total}`        (during metadata fetch)
-      `{:done, tree}`                (tree from UnreadHerring.Aggregate)
+      `{:progress, n, total}`             (during metadata fetch)
+      `{:scan_incomplete, dropped, total}` (some metadata fetches were
+                                           dropped, typically Gmail
+                                           rate limiting)
+      `{:done, tree}`                     (tree from UnreadHerring.Aggregate)
       `{:scan_error, reason}`
     A scan requested while one is already running is ignored.
   - `last_result()` -> `{:ok, %{tree: tree, opts: opts, scanned_at: dt}}`
     | `:empty` - cached so drill-down and actions don't rescan. Successful
     scans are also persisted to the cache path so the last result survives
     restarts.
-  - `clear()` - forgets the cached last scan (and any pending undo) and
-    deletes the on-disk cache file (the UI "Reset" control).
-  - `undo_last_action()` - async; reverses the most recent completed
-    action by restoring each affected message's labels to the snapshot
-    taken just before the action ran (Gmail strips labels implicitly,
-    e.g. trashing also removes INBOX, so a blanket inverse would not be
-    faithful). Broadcasts `{:undo_done, action, count}` or
-    `{:undo_error, action | nil, reason}`.
-  - `apply_action(query, action)` - async; `action` in
-    `:mark_read | :archive | :trash`. Lists ids for `query`, then
-    `Gmail.batch_modify`; broadcasts `{:action_done, action, count}` or
-    `{:action_error, action, reason}`. Trash only adds the TRASH label -
-    there is no permanent delete. Actions run independently of scans and
-    of each other: several actions may be in flight concurrently.
+  - `clear()` - forgets the cached last scan and deletes the on-disk
+    cache file (the UI "Reset" control).
+  - `apply_action(query, action)` - async; `action` is `:mark_read`, the
+    only bulk action (it removes the UNREAD label and nothing else).
+    Lists ids for `query`, then `Gmail.batch_modify`; broadcasts
+    `{:action_done, action, count}` or `{:action_error, action, reason}`.
+    Actions run independently of scans and of each other.
 
   Every Gmail call additionally merges the
   `Application.get_env(:unread_herring, :scanner_gmail_opts, [])` options,
@@ -63,7 +59,7 @@ defmodule UnreadHerring.Scanner do
     scope: [:unread, :all],
     window: [:d30, :d90, :y1, :all]
   }
-  @actions [:mark_read, :archive, :trash]
+  @actions [:mark_read]
 
   ## Client API
 
@@ -96,17 +92,6 @@ defmodule UnreadHerring.Scanner do
     GenServer.cast(server, {:apply_action, query, action})
   end
 
-  @doc """
-  Undoes the most recent completed action, asynchronously, by applying the
-  inverse label change to the exact message ids the action modified.
-  Broadcasts `{:undo_done, action, count}` or `{:undo_error, action, reason}`
-  (`{:undo_error, nil, :nothing_to_undo}` when there is nothing to undo).
-  Only the latest action is undoable, once.
-  """
-  def undo_last_action(server \\ __MODULE__) do
-    GenServer.cast(server, :undo_last_action)
-  end
-
   ## Server callbacks
 
   @impl true
@@ -118,7 +103,6 @@ defmodule UnreadHerring.Scanner do
      %{
        running: nil,
        actions: %{},
-       undo: nil,
        last: load_cache(cache_path),
        cache_path: cache_path
      }}
@@ -141,17 +125,6 @@ defmodule UnreadHerring.Scanner do
     {:noreply, %{state | actions: Map.put(state.actions, task.ref, action)}}
   end
 
-  def handle_cast(:undo_last_action, %{undo: nil} = state) do
-    broadcast({:undo_error, nil, :nothing_to_undo})
-    {:noreply, state}
-  end
-
-  def handle_cast(:undo_last_action, %{undo: undo} = state) do
-    task = Task.Supervisor.async_nolink(UnreadHerring.Tasks, fn -> run_undo(undo) end)
-    # Cleared here so a double-click cannot undo twice; restored on failure.
-    {:noreply, %{state | actions: Map.put(state.actions, task.ref, {:undo, undo}), undo: nil}}
-  end
-
   @impl true
   def handle_call(:last_result, _from, state) do
     reply = if state.last, do: {:ok, state.last}, else: :empty
@@ -160,7 +133,7 @@ defmodule UnreadHerring.Scanner do
 
   def handle_call(:clear, _from, state) do
     File.rm(state.cache_path)
-    {:reply, :ok, %{state | last: nil, undo: nil}}
+    {:reply, :ok, %{state | last: nil}}
   end
 
   @impl true
@@ -185,28 +158,8 @@ defmodule UnreadHerring.Scanner do
 
   def handle_info({ref, result}, state) when is_map_key(state.actions, ref) do
     Process.demonitor(ref, [:flush])
-    {entry, actions} = Map.pop(state.actions, ref)
-    state = %{state | actions: actions}
-
-    case result do
-      {:action_done, action, count, undo} ->
-        broadcast({:action_done, action, count})
-        {:noreply, %{state | undo: undo}}
-
-      {:undo_done, _action, _count} = message ->
-        broadcast(message)
-        {:noreply, state}
-
-      {:undo_error, _action, _reason} = message ->
-        # Restore the undo info so the user can retry.
-        broadcast(message)
-        {:undo, undo} = entry
-        {:noreply, %{state | undo: undo}}
-
-      {:action_error, _action, _reason} = message ->
-        broadcast(message)
-        {:noreply, state}
-    end
+    broadcast(result)
+    {:noreply, %{state | actions: Map.delete(state.actions, ref)}}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{running: %{ref: ref}} = state) do
@@ -217,20 +170,10 @@ defmodule UnreadHerring.Scanner do
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state)
       when is_map_key(state.actions, ref) do
-    {entry, actions} = Map.pop(state.actions, ref)
-    state = %{state | actions: actions}
-
-    case entry do
-      {:undo, undo} ->
-        Logger.warning("Undo task (#{undo.action}) crashed: #{inspect(reason)}")
-        broadcast({:undo_error, undo.action, reason})
-        {:noreply, %{state | undo: undo}}
-
-      action ->
-        Logger.warning("Action task (#{action}) crashed: #{inspect(reason)}")
-        broadcast({:action_error, action, reason})
-        {:noreply, state}
-    end
+    {action, actions} = Map.pop(state.actions, ref)
+    Logger.warning("Action task (#{action}) crashed: #{inspect(reason)}")
+    broadcast({:action_error, action, reason})
+    {:noreply, %{state | actions: actions}}
   end
 
   def handle_info(_message, state), do: {:noreply, state}
@@ -258,6 +201,12 @@ defmodule UnreadHerring.Scanner do
 
       case Gmail.fetch_metadata(ids, gmail_opts(on_each: on_each)) do
         {:ok, messages} ->
+          # Metadata fetches that kept failing after retries (typically
+          # Gmail per-minute rate limiting) are dropped from the result;
+          # tell the UI so the chart is not silently incomplete.
+          dropped = total - length(messages)
+          if dropped > 0, do: broadcast({:scan_incomplete, dropped, total})
+
           {:done, Aggregate.build_tree(messages, Map.put(opts, :labels, labels)), fetch_email()}
 
         {:error, reason} ->
@@ -291,90 +240,22 @@ defmodule UnreadHerring.Scanner do
 
   ## Action task
 
-  # The labels an undo must restore per action. Gmail makes implicit
-  # changes beyond what batchModify is asked for (trashing also strips
-  # INBOX, for example), so undo restores each message's snapshotted
-  # pre-action state for these labels instead of a blanket inverse.
-  @restore_labels %{
-    mark_read: ["UNREAD"],
-    archive: ["INBOX"],
-    trash: ["TRASH", "INBOX", "UNREAD"]
-  }
-
   defp run_action(query, action) do
-    label_opts = action_label_opts(action)
-
     with {:ok, ids} <- Gmail.list_message_ids(query, gmail_opts(max: @action_max_ids)),
-         # Snapshot the messages' labels first, so undo can restore them.
-         {:ok, pre_action} <- Gmail.fetch_metadata(ids, gmail_opts([])),
-         :ok <- Gmail.batch_modify(ids, gmail_opts(label_opts)) do
-      undo = %{
-        action: action,
-        count: length(ids),
-        groups: undo_groups(action, ids, pre_action, label_opts)
-      }
-
+         :ok <- Gmail.batch_modify(ids, gmail_opts(action_label_opts(action))) do
       # When the listing hits the cap there may be more matches we did not
       # touch; report the count as a lower bound so the UI can say so.
       count = length(ids)
       count = if count == @action_max_ids, do: {:at_least, count}, else: count
-      {:action_done, action, count, undo}
+      {:action_done, action, count}
     else
       {:error, reason} -> {:action_error, action, reason}
     end
   end
 
-  # Groups the acted-on ids by the label changes needed to put them back
-  # exactly as they were: for the action's restore-label universe, add back
-  # what a message had and remove what it did not. Ids whose snapshot is
-  # missing (their metadata fetch was dropped) get the generic inverse.
-  defp undo_groups(action, ids, pre_action, label_opts) do
-    universe = Map.fetch!(@restore_labels, action)
-    snapshots = Map.new(pre_action, &{&1.id, &1.label_ids})
-
-    generic_add = Keyword.get(label_opts, :remove_label_ids, [])
-    generic_remove = Keyword.get(label_opts, :add_label_ids, [])
-
-    ids
-    |> Enum.group_by(fn id ->
-      case Map.fetch(snapshots, id) do
-        {:ok, labels} ->
-          had = Enum.filter(universe, &(&1 in labels))
-          {had, universe -- had}
-
-        :error ->
-          {generic_add, generic_remove}
-      end
-    end)
-    |> Enum.reject(fn {{add, remove}, _ids} -> add == [] and remove == [] end)
-    |> Enum.map(fn {{add, remove}, group_ids} ->
-      %{ids: group_ids, add: add, remove: remove}
-    end)
-  end
-
-  defp run_undo(%{action: action, count: count, groups: groups}) do
-    result =
-      Enum.reduce_while(groups, :ok, fn group, :ok ->
-        case Gmail.batch_modify(
-               group.ids,
-               gmail_opts(add_label_ids: group.add, remove_label_ids: group.remove)
-             ) do
-          :ok -> {:cont, :ok}
-          {:error, reason} -> {:halt, {:error, reason}}
-        end
-      end)
-
-    case result do
-      :ok -> {:undo_done, action, count}
-      {:error, reason} -> {:undo_error, action, reason}
-    end
-  end
-
-  # Trash only adds the TRASH label (recoverable for 30 days). There is no
-  # permanent-delete code path anywhere in this module - by design.
+  # Mark-read removes the UNREAD label and nothing else; no destructive
+  # code path exists anywhere in this module - by design.
   defp action_label_opts(:mark_read), do: [remove_label_ids: ["UNREAD"]]
-  defp action_label_opts(:archive), do: [remove_label_ids: ["INBOX"]]
-  defp action_label_opts(:trash), do: [add_label_ids: ["TRASH"]]
 
   ## Helpers
 

@@ -128,6 +128,39 @@ defmodule UnreadHerring.ScannerTest do
       refute_receive {:done, _}, 100
     end
 
+    test "broadcasts scan_incomplete when metadata fetches are dropped", %{
+      cache_path: cache_path
+    } do
+      # m2's metadata fetch fails persistently (as under Gmail rate
+      # limiting once retries are exhausted) and is dropped from the tree.
+      Req.Test.stub(__MODULE__, fn conn ->
+        case conn.path_info do
+          ["gmail", "v1", "users", "me", "profile"] ->
+            Req.Test.json(conn, %{"emailAddress" => "me@example.com"})
+
+          ["gmail", "v1", "users", "me", "messages"] ->
+            Req.Test.json(conn, %{"messages" => [%{"id" => "m1"}, %{"id" => "m2"}]})
+
+          ["gmail", "v1", "users", "me", "messages", "m2"] ->
+            Plug.Conn.send_resp(conn, 403, "rateLimitExceeded")
+
+          ["gmail", "v1", "users", "me", "messages", id] ->
+            Req.Test.json(conn, %{
+              "id" => id,
+              "labelIds" => ["UNREAD"],
+              "payload" => %{"headers" => [%{"name" => "From", "value" => "a@news.com"}]}
+            })
+        end
+      end)
+
+      {name, _pid} = start_scanner!(cache_path, :s1)
+      Scanner.scan(name, %{group_by: :domain, scope: :unread, window: :all})
+
+      assert_receive {:scan_incomplete, 1, 2}, 2000
+      assert_receive {:done, tree}, 2000
+      assert tree.count == 1
+    end
+
     test "broadcasts scan_error when not authenticated", %{cache_path: cache_path} do
       # No token in the injected opts and the global TokenStore is empty,
       # so the Gmail layer reports :not_authenticated before any request.
@@ -145,7 +178,7 @@ defmodule UnreadHerring.ScannerTest do
   end
 
   describe "apply_action/3" do
-    test "trash lists ids for the query and batchModifies with TRASH only", %{
+    test "mark_read removes only the UNREAD label and never deletes", %{
       cache_path: cache_path
     } do
       test_pid = self()
@@ -162,129 +195,32 @@ defmodule UnreadHerring.ScannerTest do
             {:ok, body, conn} = Plug.Conn.read_body(conn)
             send(test_pid, {:batch_body, Jason.decode!(body)})
             Plug.Conn.send_resp(conn, 204, "")
-
-          ["gmail", "v1", "users", "me", "messages", id] ->
-            Req.Test.json(conn, %{"id" => id, "labelIds" => ["UNREAD", "INBOX"]})
         end
       end)
 
       {name, _pid} = start_scanner!(cache_path, :s1)
-      Scanner.apply_action(name, "is:unread from:@news.com", :trash)
+      Scanner.apply_action(name, "is:unread from:@news.com", :mark_read)
 
-      assert_receive {:action_done, :trash, 2}, 2000
+      assert_receive {:action_done, :mark_read, 2}, 2000
       assert_receive {:batch_body, body}
 
       assert body["ids"] == ["m1", "m2"]
-      assert body["addLabelIds"] == ["TRASH"]
-      assert body["removeLabelIds"] == []
+      assert body["addLabelIds"] == []
+      assert body["removeLabelIds"] == ["UNREAD"]
 
-      # The scope ceiling: nothing in the app ever issues a DELETE.
+      # The safety ceiling: nothing in the app ever issues a DELETE, and
+      # mark-read is the only action that exists.
       refute_received {:request, "DELETE", _path}
     end
 
-    test "mark_read removes the UNREAD label", %{cache_path: cache_path} do
-      test_pid = self()
+    test "only mark_read is an accepted action", %{cache_path: cache_path} do
+      {name, _pid} = start_scanner!(cache_path, :s1)
 
-      Req.Test.stub(__MODULE__, fn conn ->
-        case conn.path_info do
-          ["gmail", "v1", "users", "me", "messages"] ->
-            Req.Test.json(conn, %{"messages" => [%{"id" => "m1"}]})
-
-          ["gmail", "v1", "users", "me", "messages", "batchModify"] ->
-            {:ok, body, conn} = Plug.Conn.read_body(conn)
-            send(test_pid, {:batch_body, Jason.decode!(body)})
-            Plug.Conn.send_resp(conn, 204, "")
-
-          ["gmail", "v1", "users", "me", "messages", id] ->
-            Req.Test.json(conn, %{"id" => id, "labelIds" => ["UNREAD", "INBOX"]})
+      for forbidden <- [:trash, :archive, :delete] do
+        assert_raise FunctionClauseError, fn ->
+          Scanner.apply_action(name, "from:@news.com", forbidden)
         end
-      end)
-
-      {name, _pid} = start_scanner!(cache_path, :s1)
-      Scanner.apply_action(name, "from:a@b.c", :mark_read)
-
-      assert_receive {:action_done, :mark_read, 1}, 2000
-      assert_receive {:batch_body, body}
-      assert body["addLabelIds"] == []
-      assert body["removeLabelIds"] == ["UNREAD"]
-    end
-  end
-
-  describe "undo_last_action/1" do
-    defp stub_action_mailbox(test_pid, labels_by_id) do
-      Req.Test.stub(__MODULE__, fn conn ->
-        case conn.path_info do
-          ["gmail", "v1", "users", "me", "messages"] ->
-            Req.Test.json(conn, %{
-              "messages" => Enum.map(Map.keys(labels_by_id), &%{"id" => &1})
-            })
-
-          ["gmail", "v1", "users", "me", "messages", "batchModify"] ->
-            {:ok, body, conn} = Plug.Conn.read_body(conn)
-            send(test_pid, {:batch_body, Jason.decode!(body)})
-            Plug.Conn.send_resp(conn, 204, "")
-
-          ["gmail", "v1", "users", "me", "messages", id] ->
-            Req.Test.json(conn, %{"id" => id, "labelIds" => Map.fetch!(labels_by_id, id)})
-        end
-      end)
-    end
-
-    test "restores the snapshotted pre-action labels (incl. implicit ones)", %{
-      cache_path: cache_path
-    } do
-      # Trashing also implicitly strips INBOX, so undoing a trash must put
-      # INBOX (and the unread state) back, not just remove TRASH.
-      stub_action_mailbox(self(), %{"m1" => ["UNREAD", "INBOX"], "m2" => ["UNREAD", "INBOX"]})
-
-      {name, _pid} = start_scanner!(cache_path, :s1)
-
-      Scanner.apply_action(name, "from:@news.com", :trash)
-      assert_receive {:action_done, :trash, 2}, 2000
-      assert_receive {:batch_body, action_body}
-      assert action_body["addLabelIds"] == ["TRASH"]
-
-      Scanner.undo_last_action(name)
-      assert_receive {:undo_done, :trash, 2}, 2000
-      assert_receive {:batch_body, undo_body}
-
-      assert Enum.sort(undo_body["ids"]) == Enum.sort(action_body["ids"])
-      assert undo_body["addLabelIds"] == ["INBOX", "UNREAD"]
-      assert undo_body["removeLabelIds"] == ["TRASH"]
-
-      # One-shot: a second undo has nothing left to undo
-      Scanner.undo_last_action(name)
-      assert_receive {:undo_error, nil, :nothing_to_undo}, 2000
-    end
-
-    test "does not mark previously-read messages unread", %{cache_path: cache_path} do
-      # m1 was unread, m2 was already read before the mark-read action:
-      # undo restores UNREAD only on m1.
-      stub_action_mailbox(self(), %{"m1" => ["UNREAD", "INBOX"], "m2" => ["INBOX"]})
-
-      {name, _pid} = start_scanner!(cache_path, :s1)
-
-      Scanner.apply_action(name, "from:@news.com", :mark_read)
-      assert_receive {:action_done, :mark_read, 2}, 2000
-      assert_receive {:batch_body, _action_body}
-
-      Scanner.undo_last_action(name)
-      assert_receive {:undo_done, :mark_read, 2}, 2000
-
-      assert_receive {:batch_body, body_a}
-      assert_receive {:batch_body, body_b}
-      bodies = Enum.sort_by([body_a, body_b], & &1["ids"])
-
-      assert [
-               %{"ids" => ["m1"], "addLabelIds" => ["UNREAD"], "removeLabelIds" => []},
-               %{"ids" => ["m2"], "addLabelIds" => [], "removeLabelIds" => ["UNREAD"]}
-             ] = bodies
-    end
-
-    test "with no prior action reports nothing_to_undo", %{cache_path: cache_path} do
-      {name, _pid} = start_scanner!(cache_path, :s1)
-      Scanner.undo_last_action(name)
-      assert_receive {:undo_error, nil, :nothing_to_undo}, 2000
+      end
     end
   end
 

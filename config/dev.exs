@@ -10,7 +10,10 @@ config :unread_herring, UnreadHerringWeb.Endpoint,
   # Binding to loopback ipv4 address prevents access from other machines.
   # Change to `ip: {0, 0, 0, 0}` to allow access from other machines.
   http: [ip: {127, 0, 0, 1}],
-  check_origin: false,
+  # Loopback origins only (any port): `mix herring.serve` runs in dev, so a
+  # permissive check_origin here would expose the LiveView socket (and with
+  # it the bulk actions) to DNS-rebinding attacks.
+  check_origin: ["//localhost", "//127.0.0.1"],
   code_reloader: true,
   debug_errors: true,
   secret_key_base: "BEyrnH3gqEJNCHFFCHG5APfs1wf8TWMdHJ3dO6qv0p+q7b4Lu4T8t/kM7R477Rx/",

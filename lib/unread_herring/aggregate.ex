@@ -238,12 +238,14 @@ defmodule UnreadHerring.Aggregate do
         domains
         |> Enum.frequencies()
         |> Enum.map(fn {domain, count} ->
-          leaf(
-            "root/#{name}/#{domain}",
-            domain,
-            count,
-            if(domain == @unknown, do: nil, else: compose(base, filter <> " from:@" <> domain))
-          )
+          query =
+            if filter == nil or domain == @unknown do
+              nil
+            else
+              compose(base, filter <> " from:@" <> domain)
+            end
+
+          leaf("root/#{name}/#{domain}", domain, count, query)
         end)
         |> sort_children()
 
@@ -251,7 +253,7 @@ defmodule UnreadHerring.Aggregate do
         id: "root/" <> name,
         label: name,
         count: length(domains),
-        query: compose(base, filter),
+        query: filter && compose(base, filter),
         children: children
       }
     end)
@@ -261,14 +263,13 @@ defmodule UnreadHerring.Aggregate do
   defp label_filter(@no_label), do: "has:nouserlabels"
 
   defp label_filter(name) do
-    # Gmail has no way to escape a double quote inside a quoted phrase,
-    # so strip any from the label name.
-    name = String.replace(name, "\"", "")
-
-    if name =~ ~r/\s/ do
-      ~s(label:"#{name}")
-    else
-      "label:" <> name
+    cond do
+      # Gmail has no way to escape a double quote inside a quoted phrase;
+      # any rewrite would aim the query at a DIFFERENT label, so such
+      # buckets get no query at all (no Gmail link, no actions).
+      String.contains?(name, "\"") -> nil
+      name =~ ~r/\s/ -> ~s(label:"#{name}")
+      true -> "label:" <> name
     end
   end
 

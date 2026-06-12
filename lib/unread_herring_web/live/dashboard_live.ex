@@ -2,9 +2,10 @@ defmodule UnreadHerringWeb.DashboardLive do
   @moduledoc """
   The dashboard: scan controls, live progress, the server-rendered SVG
   sunburst with drill-down and breadcrumbs, a side panel with the focused
-  bucket's children, "Open in Gmail" links, and bulk actions
-  (mark-read / archive / trash). Every action is gated by a confirm modal,
-  and acted-on buckets stay grayed out until the next scan.
+  bucket's children, "Open in Gmail" links, and the mark-read bulk action.
+  Actions are gated by a confirm modal (a double one when targeting the
+  whole scan result), and acted-on buckets stay grayed out until the next
+  scan.
   """
 
   use UnreadHerringWeb, :live_view
@@ -40,10 +41,9 @@ defmodule UnreadHerringWeb.DashboardLive do
         current_root_id: "root",
         pending_action: nil,
         acted: %{},
-        undo_offer: nil,
-        last_action_target: nil,
         confirming_logout?: false,
         user_email: nil,
+        scan_dropped: nil,
         last_scanned_at: nil,
         last_scan_max: nil
       )
@@ -84,6 +84,7 @@ defmodule UnreadHerringWeb.DashboardLive do
        form: to_form(params, as: "scan"),
        scanning?: true,
        progress: nil,
+       scan_dropped: nil,
        last_scan_max: opts.max
      )}
   end
@@ -157,17 +158,13 @@ defmodule UnreadHerringWeb.DashboardLive do
         # a second, starker confirmation.
         {:noreply, assign(socket, pending_action: Map.put(target, :stage, :final))}
 
-      %{action: action, query: query, node_id: node_id, label: label} ->
+      %{action: action, query: query, node_id: node_id} ->
         Scanner.apply_action(query, action)
         acted = Map.put(socket.assigns.acted, node_id, %{action: action, status: :pending})
 
         {:noreply,
          socket
-         |> assign(
-           pending_action: nil,
-           acted: acted,
-           last_action_target: %{action: action, node_id: node_id, label: label}
-         )
+         |> assign(pending_action: nil, acted: acted)
          |> assign_derived()}
 
       nil ->
@@ -177,17 +174,6 @@ defmodule UnreadHerringWeb.DashboardLive do
 
   def handle_event("cancel_action", _params, socket) do
     {:noreply, assign(socket, pending_action: nil)}
-  end
-
-  def handle_event("undo", _params, socket) do
-    case socket.assigns.undo_offer do
-      %{status: :ready} = offer ->
-        Scanner.undo_last_action()
-        {:noreply, assign(socket, undo_offer: %{offer | status: :undoing})}
-
-      _none_or_in_flight ->
-        {:noreply, socket}
-    end
   end
 
   def handle_event("reset", _params, socket) do
@@ -237,10 +223,9 @@ defmodule UnreadHerringWeb.DashboardLive do
       current_root_id: "root",
       pending_action: nil,
       acted: %{},
-      undo_offer: nil,
-      last_action_target: nil,
       confirming_logout?: false,
       user_email: nil,
+      scan_dropped: nil,
       last_scanned_at: nil,
       last_scan_max: nil
     )
@@ -278,13 +263,15 @@ defmodule UnreadHerringWeb.DashboardLive do
        current_root_id: "root",
        pending_action: nil,
        acted: %{},
-       undo_offer: nil,
-       last_action_target: nil,
        last_scanned_at: DateTime.utc_now()
      )
      |> assign_derived()
      # A fresh scan re-roots, so drop any ?node= from the URL
      |> push_patch(to: ~p"/")}
+  end
+
+  def handle_info({:scan_incomplete, dropped, total}, socket) do
+    {:noreply, assign(socket, scan_dropped: {dropped, total})}
   end
 
   def handle_info({:scan_error, :not_authenticated}, socket) do
@@ -310,53 +297,11 @@ defmodule UnreadHerringWeb.DashboardLive do
         entry -> entry
       end)
 
-    undo_offer =
-      case socket.assigns.last_action_target do
-        %{action: ^action} = target ->
-          %{
-            action: action,
-            count: count,
-            label: target.label,
-            node_id: target.node_id,
-            status: :ready
-          }
-
-        _other ->
-          socket.assigns.undo_offer
-      end
-
     {:noreply,
      socket
-     |> assign(acted: acted, undo_offer: undo_offer)
+     |> assign(acted: acted)
      |> assign_derived()
      |> put_flash(:info, action_done_message(action, count) <> " Re-scan to refresh the chart.")}
-  end
-
-  def handle_info({:undo_done, _action, count}, socket) do
-    acted =
-      case socket.assigns.undo_offer do
-        %{node_id: node_id} -> Map.delete(socket.assigns.acted, node_id)
-        nil -> socket.assigns.acted
-      end
-
-    {:noreply,
-     socket
-     |> assign(acted: acted, undo_offer: nil, last_action_target: nil)
-     |> assign_derived()
-     |> put_flash(:info, "Undo complete: restored #{count_text(count)} messages.")}
-  end
-
-  def handle_info({:undo_error, _action, reason}, socket) do
-    undo_offer =
-      case socket.assigns.undo_offer do
-        %{} = offer -> %{offer | status: :ready}
-        nil -> nil
-      end
-
-    {:noreply,
-     socket
-     |> assign(undo_offer: undo_offer)
-     |> put_flash(:error, "Undo failed: #{inspect(reason)}")}
   end
 
   def handle_info({:action_error, action, reason}, socket) do
@@ -458,8 +403,6 @@ defmodule UnreadHerringWeb.DashboardLive do
   end
 
   defp parse_action("mark_read"), do: :mark_read
-  defp parse_action("archive"), do: :archive
-  defp parse_action("trash"), do: :trash
   defp parse_action(_other), do: nil
 
   ## View helpers
@@ -486,28 +429,13 @@ defmodule UnreadHerringWeb.DashboardLive do
   defp share_of(count, total), do: percent(count / total)
 
   defp action_label(:mark_read), do: "Mark read"
-  defp action_label(:archive), do: "Archive"
-  defp action_label(:trash), do: "Trash"
 
   defp confirm_title(:mark_read), do: "Mark as read?"
-  defp confirm_title(:archive), do: "Archive?"
-  defp confirm_title(:trash), do: "Move to trash?"
 
   defp confirm_button(:mark_read), do: "Mark read"
-  defp confirm_button(:archive), do: "Archive"
-  defp confirm_button(:trash), do: "Move to trash"
 
   defp acted_badge(%{status: :pending}), do: "applying..."
   defp acted_badge(%{action: :mark_read}), do: "Marked read"
-  defp acted_badge(%{action: :archive}), do: "Archived"
-  defp acted_badge(%{action: :trash}), do: "Trashed"
-
-  defp count_text({:at_least, n}), do: "at least #{n}"
-  defp count_text(n), do: to_string(n)
-
-  defp undo_offer_text(%{action: action, count: count, label: label}) do
-    "#{acted_badge(%{action: action, status: :done})}: #{count_text(count)} messages in \"#{label}\"."
-  end
 
   # The Scanner reports {:at_least, n} when its id listing hit the cap,
   # meaning more matching messages were left untouched.
@@ -517,8 +445,6 @@ defmodule UnreadHerringWeb.DashboardLive do
   end
 
   defp action_done_message(:mark_read, count), do: "Marked #{count} messages as read."
-  defp action_done_message(:archive, count), do: "Archived #{count} messages."
-  defp action_done_message(:trash, count), do: "Moved #{count} messages to trash."
 
   defp truncate(label, max) when byte_size(label) <= max, do: label
   defp truncate(label, max), do: String.slice(label, 0, max - 1) <> "…"
@@ -627,16 +553,16 @@ defmodule UnreadHerringWeb.DashboardLive do
           </span>
         </div>
 
-        <div :if={@undo_offer} id="undo-bar" class="alert text-sm">
-          <span>Last action - {undo_offer_text(@undo_offer)}</span>
-          <button
-            type="button"
-            class="btn btn-sm btn-outline"
-            phx-click="undo"
-            disabled={@undo_offer.status == :undoing}
-          >
-            {if @undo_offer.status == :undoing, do: "Undoing...", else: "Undo"}
-          </button>
+        <div
+          :if={@scan_dropped}
+          id="scan-incomplete-notice"
+          class="alert alert-warning text-sm"
+        >
+          <span>
+            {elem(@scan_dropped, 0)} of {elem(@scan_dropped, 1)} messages could not be
+            fetched - Gmail's per-minute quota was likely exceeded. The chart is
+            incomplete; wait a minute and scan again (or lower "Max messages").
+          </span>
         </div>
 
         <%= cond do %>
@@ -772,24 +698,6 @@ defmodule UnreadHerringWeb.DashboardLive do
                       >
                         Mark read
                       </button>
-                      <button
-                        type="button"
-                        class="btn btn-sm"
-                        phx-click="request_action"
-                        phx-value-action="archive"
-                        disabled={@focused_acted != nil}
-                      >
-                        Archive
-                      </button>
-                      <button
-                        type="button"
-                        class="btn btn-sm btn-error btn-outline"
-                        phx-click="request_action"
-                        phx-value-action="trash"
-                        disabled={@focused_acted != nil}
-                      >
-                        Trash
-                      </button>
                     </div>
                   </div>
                 </div>
@@ -878,22 +786,14 @@ defmodule UnreadHerringWeb.DashboardLive do
                   {@pending_action.query}
                 </code>
                 <span :if={@pending_action.query == ""}>the scan scope</span>
-                (up to 10,000 at a time). Are you sure?
-              </p>
-              <p :if={@pending_action.action == :trash} class="pb-3 text-sm opacity-70">
-                Trashed messages stay recoverable in Gmail for 30 days. Nothing is ever
-                permanently deleted by this app.
+                (up to 10,000 at a time). Note that Gmail's <code>from:</code>
+                matching
+                is broader than the chart's grouping (subdomains, plus-addresses), so
+                slightly more mail than the wedge count may match. Are you sure?
               </p>
               <div class="modal-action">
                 <button type="button" class="btn" phx-click="cancel_action">Cancel</button>
-                <button
-                  type="button"
-                  class={[
-                    "btn",
-                    if(@pending_action.action == :trash, do: "btn-error", else: "btn-primary")
-                  ]}
-                  phx-click="confirm_action"
-                >
+                <button type="button" class="btn btn-primary" phx-click="confirm_action">
                   {confirm_button(@pending_action.action)}
                 </button>
               </div>

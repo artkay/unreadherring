@@ -115,27 +115,26 @@ defmodule UnreadHerring.Auth.TokenStore do
   end
 
   def handle_call(:disconnect, _from, state) do
-    result =
-      case state.token do
-        nil ->
-          :cleared
-
-        token ->
-          # Revoking the refresh token withdraws the whole grant; fall back
-          # to the access token if there is no refresh token.
-          case UnreadHerring.Auth.revoke(token.refresh_token || token.access_token) do
-            :ok ->
-              :revoked
-
-            {:error, reason} ->
-              Logger.warning("Token revocation at Google failed: #{inspect(reason)}")
-              :cleared
-          end
-      end
+    result = revoke_grant(state.token)
 
     # The local copy goes away regardless of whether Google was reachable.
     File.rm(state.path)
     {:reply, result, %{state | token: nil}}
+  end
+
+  defp revoke_grant(nil), do: :cleared
+
+  # Revoking the refresh token withdraws the whole grant; fall back to
+  # the access token if there is no refresh token.
+  defp revoke_grant(token) do
+    case UnreadHerring.Auth.revoke(token.refresh_token || token.access_token) do
+      :ok ->
+        :revoked
+
+      {:error, reason} ->
+        Logger.warning("Token revocation at Google failed: #{inspect(reason)}")
+        :cleared
+    end
   end
 
   ## Helpers

@@ -18,20 +18,23 @@ no hosted service, no telemetry, no shipped credentials.
 ## Use at your own risk
 
 This tool **bulk-modifies your real mailbox**. By using it you accept that you
-do so entirely at your own risk and that you know what you are doing:
+do so entirely at your own risk and that you must know what you are doing:
 
 - You should understand what you are granting when you create the OAuth
-  client and approve the `gmail.modify` scope, and what mark-read / archive /
-  trash mean when applied to thousands of messages at once.
-- Confirmations and a one-step undo exist, but undo covers only the **last**
-  action, and Gmail **permanently purges trashed messages after about 30
-  days** - after that nothing can bring them back.
+  client and approve the `gmail.modify` scope.
+- The only bulk action is **mark read**: it removes the UNREAD label and
+  nothing else (the app never archives, trashes or deletes). It is gated
+  behind confirmations, but marking thousands of messages read is still not
+  reversible from within the app: Gmail's own `is:unread` searches will no
+  longer find them.
+- Gmail's `from:` search matches more broadly than the chart's exact-domain
+  grouping (subdomains, plus-addressing), so an action can affect somewhat
+  more mail than the wedge count suggests. The confirm dialog says so.
 - The software is provided as is, without warranty of any kind (see
-  [LICENSE](LICENSE)). The authors are not responsible for lost or altered
-  mail.
+  [LICENSE](LICENSE)). The authors are not responsible for altered mail.
 
-If any of the above gives you pause, explore with `scope: all` + "Open in
-Gmail" links only, and leave the bulk action buttons alone.
+If any of the above gives you pause, explore the chart and the "Open in
+Gmail" links only, and leave the Mark read button alone.
 
 ## How it works
 
@@ -47,12 +50,10 @@ Gmail" links only, and leave the bulk action buttons alone.
    and filtered-away mail. Counts are individual messages, not conversations.
 4. Explore the sunburst: click a wedge to drill down, click the center to go
    back up, click "Open in Gmail" to see the real filtered view, or bulk
-   mark-read / archive / trash a bucket (trash is the ceiling - the app never
-   permanently deletes anything). Every bulk action asks for confirmation
-   (twice when it targets the whole scan result), acted-on buckets gray out
-   until the next scan, and the last action can be undone with one click.
-   "Disconnect Gmail" revokes the app's authorization at Google and deletes
-   the stored token and local scan cache when you are done.
+   **mark a bucket read**. Mark read asks for confirmation (twice when it
+   targets the whole scan result) and acted-on buckets gray out until the
+   next scan. "Disconnect Gmail" revokes the app's authorization at Google
+   and deletes the stored token and local scan cache when you are done.
 
 ## Setup: bring your own OAuth client (required)
 
@@ -110,18 +111,24 @@ mix test              # full test suite; no live Gmail calls anywhere
   HERRING_SCAN_MAX=50000 mix herring.serve
   ```
 
-- **Bulk actions** (mark read / archive / trash) apply to at most 10,000
-  matching messages per click; the toast says "at least N" when there may
-  be more, and clicking again continues where it left off.
+- **Rate limiting.** Google enforces a per-minute quota on top of the
+  per-second one. Large scans can hit it; the app backs off and retries
+  automatically, and if messages still could not be fetched the dashboard
+  shows a warning that the chart is incomplete - wait a minute and scan
+  again.
+
+- **Bulk mark-read** applies to at most 10,000 matching messages per click;
+  the toast says "at least N" when there may be more, and clicking again
+  continues where it left off.
 
 ## Privacy model
 
 - Every user is their own Google Cloud "app", in Testing mode, scoped to
   themselves. The project never operates a shared OAuth client, so it never
   needs Google verification.
-- OAuth scope ceiling is `gmail.modify`: the code can mark read, archive and
-  move to trash (recoverable for 30 days), and has **no permanent-delete
-  path**.
+- OAuth scope ceiling is `gmail.modify`, and the only write the code ever
+  performs is removing the UNREAD label (mark read). There is **no archive,
+  trash or delete code path**.
 - The endpoint binds to the loopback interface only.
 - On-disk state is limited to `~/.config/unread_herring/` (OAuth token,
   `0600`).

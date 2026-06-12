@@ -52,31 +52,30 @@ defmodule Mix.Tasks.Herring.Smoke do
     Mix.shell().info("Listing messages for query \"#{query}\" (max #{max})...")
 
     case UnreadHerring.Gmail.list_message_ids(query, max: max) do
-      {:ok, []} ->
-        Mix.shell().info("No messages matched.")
+      {:ok, []} -> Mix.shell().info("No messages matched.")
+      {:ok, ids} -> fetch_and_print(ids)
+      {:error, reason} -> Mix.shell().error("Listing messages failed: #{inspect(reason)}")
+    end
+  end
 
-      {:ok, ids} ->
-        Mix.shell().info("Fetching metadata for #{length(ids)} messages...")
+  defp fetch_and_print(ids) do
+    Mix.shell().info("Fetching metadata for #{length(ids)} messages...")
 
-        counter = :counters.new(1, [])
+    counter = :counters.new(1, [])
 
-        on_each = fn _result ->
-          :counters.add(counter, 1, 1)
-          if rem(:counters.get(counter, 1), @progress_dot_every) == 0, do: IO.write(".")
-        end
+    on_each = fn _result ->
+      :counters.add(counter, 1, 1)
+      if rem(:counters.get(counter, 1), @progress_dot_every) == 0, do: IO.write(".")
+    end
 
-        case UnreadHerring.Gmail.fetch_metadata(ids, on_each: on_each) do
-          {:ok, messages} ->
-            IO.write("\n")
-            Mix.shell().info("Fetched #{length(messages)} of #{length(ids)} messages.")
-            print_domain_table(messages)
-
-          {:error, reason} ->
-            Mix.shell().error("Metadata fetch failed: #{inspect(reason)}")
-        end
+    case UnreadHerring.Gmail.fetch_metadata(ids, on_each: on_each) do
+      {:ok, messages} ->
+        IO.write("\n")
+        Mix.shell().info("Fetched #{length(messages)} of #{length(ids)} messages.")
+        print_domain_table(messages)
 
       {:error, reason} ->
-        Mix.shell().error("Listing messages failed: #{inspect(reason)}")
+        Mix.shell().error("Metadata fetch failed: #{inspect(reason)}")
     end
   end
 
@@ -113,15 +112,18 @@ defmodule Mix.Tasks.Herring.Smoke do
         nil -> from
       end
 
-    case address |> String.trim() |> String.split("@") do
-      parts when length(parts) >= 2 ->
-        case parts |> List.last() |> String.trim() |> String.downcase() do
-          "" -> "unknown"
-          domain -> domain
-        end
+    address
+    |> String.trim()
+    |> String.split("@")
+    |> domain_from_parts()
+  end
 
-      _ ->
-        "unknown"
+  defp domain_from_parts([_local | _rest] = parts) when length(parts) >= 2 do
+    case parts |> List.last() |> String.trim() |> String.downcase() do
+      "" -> "unknown"
+      domain -> domain
     end
   end
+
+  defp domain_from_parts(_no_at_sign), do: "unknown"
 end

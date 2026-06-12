@@ -210,6 +210,20 @@ defmodule UnreadHerring.AggregateTest do
       assert newsletters.query == "label:Newsletters"
     end
 
+    test "a label name containing a double quote gets no query at all" do
+      # Gmail cannot escape a quote inside a quoted phrase; any rewrite
+      # would target a DIFFERENT label, so the bucket must be unsearchable.
+      labels = %{"Label_9" => ~s(My "fancy" label)}
+      messages = [msg("1", "a@news.com", ["Label_9"])]
+
+      tree = Aggregate.build_tree(messages, %{group_by: :label, labels: labels})
+      [label_node] = tree.children
+
+      assert label_node.label == ~s(My "fancy" label)
+      assert label_node.query == nil
+      assert Enum.all?(label_node.children, &is_nil(&1.query))
+    end
+
     test "no user label goes under (no label) with has:nouserlabels", %{tree: tree} do
       no_label = Enum.find(tree.children, &(&1.label == "(no label)"))
       assert no_label.id == "root/(no label)"

@@ -11,7 +11,8 @@ defmodule UnreadHerring.Gmail do
     this (together with the `:gmail_req_options` application env) to inject
     `plug: {Req.Test, UnreadHerring.Gmail}` and disable retries.
 
-  Requests retry transient failures (429 and 5xx) up to 4 times by default.
+  Requests retry transient failures (429, 5xx, and Gmail's 403-flavored
+  rate limiting) up to 5 times with exponential backoff by default.
   """
 
   require Logger
@@ -259,11 +260,45 @@ defmodule UnreadHerring.Gmail do
     [
       base_url: @base_url,
       auth: {:bearer, token},
-      retry: :transient,
-      max_retries: 4
+      retry: &retry?/2,
+      retry_delay: &retry_delay/1,
+      max_retries: 5
     ]
     |> Keyword.merge(Application.get_env(:unread_herring, :gmail_req_options, []))
     |> Keyword.merge(Keyword.get(opts, :req_options, []))
     |> Req.new()
+  end
+
+  # Gmail signals per-user rate limiting with a 403 + "rateLimitExceeded"
+  # (not 429), which Req's :transient retry does not cover - so without
+  # this, big scans hammer the API and silently drop messages.
+  defp retry?(_request, %Req.Response{status: 403} = response), do: rate_limited?(response)
+
+  defp retry?(_request, %Req.Response{status: status}),
+    do: status in [408, 429, 500, 502, 503, 504]
+
+  defp retry?(_request, %Req.TransportError{}), do: true
+  defp retry?(_request, _other), do: false
+
+  defp rate_limited?(%Req.Response{body: body}) when is_map(body) do
+    reasons =
+      body
+      |> get_in(["error", "errors", Access.all(), "reason"])
+      |> List.wrap()
+
+    "rateLimitExceeded" in reasons or "userRateLimitExceeded" in reasons
+  end
+
+  defp rate_limited?(%Req.Response{body: body}) when is_binary(body) do
+    body =~ "rateLimitExceeded"
+  end
+
+  defp rate_limited?(_response), do: false
+
+  # The rate-limit window is per minute, so back off long enough to let it
+  # refill: ~1s, 2s, 4s, 8s, 16s (plus jitter), capped at 30s.
+  defp retry_delay(attempt) do
+    base = min(1000 * Integer.pow(2, attempt), 30_000)
+    base + :rand.uniform(500)
   end
 end

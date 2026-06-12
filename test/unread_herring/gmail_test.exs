@@ -253,6 +253,68 @@ defmodule UnreadHerring.GmailTest do
     end
   end
 
+  describe "rate limiting" do
+    test "a 403 rateLimitExceeded is retried with backoff" do
+      # Gmail reports per-user rate limiting as 403 (not 429); the request
+      # must back off and retry rather than fail and drop the message.
+      {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+      Req.Test.stub(UnreadHerring.Gmail, fn conn ->
+        case Agent.get_and_update(attempts, &{&1 + 1, &1 + 1}) do
+          1 ->
+            conn
+            |> Plug.Conn.put_status(403)
+            |> Req.Test.json(%{
+              "error" => %{
+                "code" => 403,
+                "errors" => [%{"domain" => "usageLimits", "reason" => "rateLimitExceeded"}],
+                "status" => "PERMISSION_DENIED"
+              }
+            })
+
+          _later ->
+            Req.Test.json(conn, %{"messages" => [%{"id" => "m1"}]})
+        end
+      end)
+
+      retrying_opts = [
+        token: @token,
+        req_options: [plug: {Req.Test, UnreadHerring.Gmail}, retry_delay: fn _n -> 1 end]
+      ]
+
+      assert {:ok, ["m1"]} = Gmail.list_message_ids("is:unread", retrying_opts)
+      assert Agent.get(attempts, & &1) == 2
+    end
+
+    test "a non-rate-limit 403 is not retried" do
+      {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+      Req.Test.stub(UnreadHerring.Gmail, fn conn ->
+        Agent.update(attempts, &(&1 + 1))
+
+        conn
+        |> Plug.Conn.put_status(403)
+        |> Req.Test.json(%{
+          "error" => %{
+            "code" => 403,
+            "errors" => [%{"domain" => "global", "reason" => "insufficientPermissions"}],
+            "status" => "PERMISSION_DENIED"
+          }
+        })
+      end)
+
+      retrying_opts = [
+        token: @token,
+        req_options: [plug: {Req.Test, UnreadHerring.Gmail}, retry_delay: fn _n -> 1 end]
+      ]
+
+      assert {:error, {:http_error, 403, _body}} =
+               Gmail.list_message_ids("is:unread", retrying_opts)
+
+      assert Agent.get(attempts, & &1) == 1
+    end
+  end
+
   describe "get_profile/1" do
     test "returns the authenticated account's email address" do
       Req.Test.stub(UnreadHerring.Gmail, fn conn ->
