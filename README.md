@@ -11,6 +11,10 @@ LiveView; launched from the terminal.
 Nothing leaves your machine except calls to the Gmail API itself. No database,
 no hosted service, no telemetry, no shipped credentials.
 
+<p align="center">
+  <img src="docs/screenshot-dark.png" alt="Unread Herring dashboard: a sunburst of unread mail grouped by sender domain, with drill-down, per-domain counts and bulk actions" width="800" />
+</p>
+
 ## Use at your own risk
 
 This tool **bulk-modifies your real mailbox**. By using it you accept that you
