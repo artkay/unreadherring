@@ -165,6 +165,7 @@ defmodule UnreadHerring.Auth.TokenStoreTest do
       assert TokenStore.status(name) == :unauthenticated
     end
 
+    @tag capture_log: true
     test "clears locally even when revocation fails", %{name: name, path: path} do
       pid = start_store!(name, path)
       assert :ok = TokenStore.put_token(name, valid_token())

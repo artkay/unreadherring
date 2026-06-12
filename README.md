@@ -56,7 +56,7 @@ Gmail" links only, and leave the bulk action buttons alone.
 
 ## Setup: bring your own OAuth client (required)
 
-This project ships **no Google credentials**. You create your own OAuth
+This project **requires Google credentials** to work. You create your own OAuth
 client in your own Google Cloud project, so your data is only ever between
 you and Google:
 
@@ -81,8 +81,6 @@ you and Google:
 
 > **Note:** while the consent screen is in Testing mode, Google may expire
 > refresh tokens after about 7 days; just re-run the auth flow when prompted.
-> Publishing the consent screen to Production (still unverified, still just
-> you) avoids the weekly expiry.
 
 ## Running
 
@@ -130,11 +128,17 @@ mix test              # full test suite; no live Gmail calls anywhere
 
 ## Packaging
 
-`mix release` produces a standard self-contained release (start it with
-`PHX_SERVER=1 PORT=4000 _build/prod/rel/unread_herring/bin/unread_herring start`).
-Single-file `herring` binaries via [Burrito](https://github.com/burrito-elixir/burrito)
-are a planned follow-up; Burrito needs Zig and xz on the build machine, and
-unsigned macOS binaries need a Gatekeeper exemption.
+Build and run a standard self-contained release:
+
+```sh
+mix assets.deploy                  # compile + digest assets (prod requires the manifest)
+MIX_ENV=prod mix release
+PHX_SERVER=1 PORT=4000 _build/prod/rel/unread_herring/bin/unread_herring start
+```
+
+Note: `mix release` builds for the current `MIX_ENV`, so a bare invocation
+produces a dev-mode release under `_build/dev/rel/...` instead - set
+`MIX_ENV=prod` for the real thing.
 
 ## Development
 

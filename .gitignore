@@ -31,6 +31,11 @@ unread_herring-*.tar
 # Ignore digested assets cache.
 /priv/static/cache_manifest.json
 
+# Ignore digested copies of static files produced by `mix phx.digest`
+# (a -<md5> suffixed copy and .gz variants of every static file).
+/priv/static/**/*.gz
+/priv/static/**/*-????????????????????????????????.*
+
 # In case you use Node.js/npm, you want to ignore these.
 npm-debug.log
 /assets/node_modules/
