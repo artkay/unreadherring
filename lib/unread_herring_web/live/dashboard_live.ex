@@ -786,7 +786,7 @@ defmodule UnreadHerringWeb.DashboardLive do
                   {@pending_action.query}
                 </code>
                 <span :if={@pending_action.query == ""}>the scan scope</span>
-                (up to 10,000 at a time). Note that Gmail's <code>from:</code>
+                (up to {Scanner.action_max_ids()} at a time). Note that Gmail's <code>from:</code>
                 matching
                 is broader than the chart's grouping (subdomains, plus-addresses), so
                 slightly more mail than the wedge count may match. Are you sure?

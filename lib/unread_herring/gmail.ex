@@ -296,9 +296,12 @@ defmodule UnreadHerring.Gmail do
   defp rate_limited?(_response), do: false
 
   # The rate-limit window is per minute, so back off long enough to let it
-  # refill: ~1s, 2s, 4s, 8s, 16s (plus jitter), capped at 30s.
+  # refill: ~1s, 2s, 4s, 8s, 16s at the default max_retries of 5. The 30s
+  # cap only kicks in when callers raise max_retries via req options.
+  # Jitter is proportional (up to 25% of the delay) so the ~15 fan-out
+  # workers that got rate limited together do not retry in lockstep.
   defp retry_delay(attempt) do
     base = min(1000 * Integer.pow(2, attempt), 30_000)
-    base + :rand.uniform(500)
+    base + :rand.uniform(max(div(base, 4), 1))
   end
 end

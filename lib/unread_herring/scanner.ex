@@ -92,6 +92,9 @@ defmodule UnreadHerring.Scanner do
     GenServer.cast(server, {:apply_action, query, action})
   end
 
+  @doc "Maximum number of messages a single bulk action will touch."
+  def action_max_ids, do: @action_max_ids
+
   ## Server callbacks
 
   @impl true
