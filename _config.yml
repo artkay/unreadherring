@@ -7,7 +7,6 @@ exclude:
   - unread-herring-plan.md
   - assets/
   - config/
-  - docs/
   - lib/
   - priv/
   - test/
