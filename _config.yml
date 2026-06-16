@@ -1,0 +1,15 @@
+readme_index:
+  remove_originals: true
+
+exclude:
+  - AGENTS.md
+  - CLAUDE.md
+  - unread-herring-plan.md
+  - assets/
+  - config/
+  - docs/
+  - lib/
+  - priv/
+  - test/
+  - mix.exs
+  - mix.lock
