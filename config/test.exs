@@ -15,6 +15,10 @@ config :unread_herring, UnreadHerring.Auth,
   client_id: "test-client-id.apps.googleusercontent.com",
   client_secret: "test-client-secret"
 
+# No client-side Gmail throttling against Req.Test stubs; tests that cover
+# the throttle pass :max_rate explicitly.
+config :unread_herring, :gmail_max_rate, nil
+
 # Print only warnings and errors during test
 config :logger, level: :warning
 

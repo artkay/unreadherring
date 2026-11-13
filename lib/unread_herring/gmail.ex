@@ -12,7 +12,11 @@ defmodule UnreadHerring.Gmail do
     `plug: {Req.Test, UnreadHerring.Gmail}` and disable retries.
 
   Requests retry transient failures (429, 5xx, and Gmail's 403-flavored
-  rate limiting) up to 5 times with exponential backoff by default.
+  rate limiting) up to 6 times with exponential backoff by default.
+
+  `fetch_metadata/2` also throttles itself below Gmail's per-user quota
+  (see `:max_rate`), so backoff is a safety net rather than the main flow
+  control.
   """
 
   require Logger
@@ -21,7 +25,23 @@ defmodule UnreadHerring.Gmail do
   @page_size 500
   @default_max_concurrency 15
   @batch_modify_chunk 1000
-  @metadata_timeout 30_000
+  # Six retries back off for ~61s in total, enough to outlast a fully
+  # exhausted per-minute quota window.
+  @default_max_retries 6
+
+  # The binding limit is the per-project, per-user "Units per minute per
+  # user" quota (totalQueryCostPerMinutePerUser), observed at 6,000 units on
+  # a fresh BYO Cloud project. messages.get costs 5 units, so that allows
+  # 1,200 fetches a minute (20/s sustained). Bursting faster just exhausts
+  # the minute early and 403s the rest of it. Default to a bit under 20 so
+  # the occasional messages.list page also fits; projects with a raised
+  # quota can go higher via HERRING_MAX_RATE.
+  @default_max_rate 18
+
+  # Extra time a metadata task gets on top of its worst-case retry backoff,
+  # to cover the requests themselves. The task timeout only guards against a
+  # stuck task; it must never cut a task off while it is still backing off.
+  @metadata_timeout_slack 60_000
 
   @doc """
   Lists message ids matching the Gmail search `query`.
@@ -84,9 +104,16 @@ defmodule UnreadHerring.Gmail do
   (HTTP errors, timeouts) are logged and dropped, so the result list may be
   shorter than `ids`. Ordering is not preserved.
 
+  Throughput is capped at `:max_rate` requests per second across all
+  workers: each worker spends at least `max_concurrency / max_rate` seconds
+  per message. Each task's timeout is derived from the retry schedule, so a
+  message that is still backing off is never killed and dropped.
+
   Options: `:max_concurrency` (default #{@default_max_concurrency}),
-  `:on_each` (arity-1 callback invoked once per completed message, success or
-  drop), plus the common `:token` / `:req_options`.
+  `:max_rate` (requests per second; defaults to the `:gmail_max_rate` app
+  env, else #{@default_max_rate}; `nil` disables throttling), `:on_each`
+  (arity-1 callback invoked once per completed message, success or drop),
+  plus the common `:token` / `:req_options`.
   """
   @spec fetch_metadata([String.t()], keyword()) ::
           {:ok, [%{id: String.t(), from: String.t() | nil, label_ids: [String.t()]}]}
@@ -97,13 +124,17 @@ defmodule UnreadHerring.Gmail do
       req = build_req(token, opts)
       max_concurrency = Keyword.get(opts, :max_concurrency, @default_max_concurrency)
       on_each = Keyword.get(opts, :on_each)
+      min_interval = min_interval_ms(max_concurrency, max_rate(opts))
+      max_retries = Req.Request.get_option(req, :max_retries, @default_max_retries)
 
       messages =
         UnreadHerring.Tasks
-        |> Task.Supervisor.async_stream_nolink(ids, &fetch_one(req, &1),
+        |> Task.Supervisor.async_stream_nolink(
+          ids,
+          fn id -> throttled(min_interval, fn -> fetch_one(req, id) end) end,
           max_concurrency: max_concurrency,
           ordered: false,
-          timeout: @metadata_timeout,
+          timeout: metadata_timeout(max_retries),
           on_timeout: :kill_task
         )
         |> Enum.reduce([], fn result, acc ->
@@ -125,6 +156,40 @@ defmodule UnreadHerring.Gmail do
 
       {:ok, messages}
     end
+  end
+
+  defp max_rate(opts) do
+    Keyword.get_lazy(opts, :max_rate, fn ->
+      Application.get_env(:unread_herring, :gmail_max_rate, @default_max_rate)
+    end)
+  end
+
+  defp min_interval_ms(_max_concurrency, nil), do: 0
+
+  defp min_interval_ms(max_concurrency, max_rate) when max_rate > 0,
+    do: ceil(max_concurrency * 1000 / max_rate)
+
+  # async_stream runs at most max_concurrency tasks at once and starts the
+  # next one only when a slot frees up, so padding every task to at least
+  # min_interval caps total throughput at max_concurrency / min_interval
+  # without any shared state. Slow responses (or retries) are not padded
+  # further; the wait only fills the remainder.
+  defp throttled(0, fun), do: fun.()
+
+  defp throttled(min_interval, fun) do
+    started = System.monotonic_time(:millisecond)
+    result = fun.()
+    elapsed = System.monotonic_time(:millisecond) - started
+    if elapsed < min_interval, do: Process.sleep(min_interval - elapsed)
+    result
+  end
+
+  @doc false
+  # Task timeout for one metadata fetch: the worst-case backoff across all
+  # retries (maximum jitter included) plus slack for the requests themselves.
+  def metadata_timeout(max_retries) do
+    backoff = Enum.sum_by(0..(max_retries - 1)//1, &max_retry_delay/1)
+    backoff + @metadata_timeout_slack
   end
 
   defp fetch_one(req, id) do
@@ -262,7 +327,7 @@ defmodule UnreadHerring.Gmail do
       auth: {:bearer, token},
       retry: &retry?/2,
       retry_delay: &retry_delay/1,
-      max_retries: 5
+      max_retries: @default_max_retries
     ]
     |> Keyword.merge(Application.get_env(:unread_herring, :gmail_req_options, []))
     |> Keyword.merge(Keyword.get(opts, :req_options, []))
@@ -296,12 +361,19 @@ defmodule UnreadHerring.Gmail do
   defp rate_limited?(_response), do: false
 
   # The rate-limit window is per minute, so back off long enough to let it
-  # refill: ~1s, 2s, 4s, 8s, 16s at the default max_retries of 5. The 30s
-  # cap only kicks in when callers raise max_retries via req options.
+  # refill: ~1s, 2s, 4s, 8s, 16s, 30s (capped) at the default max_retries
+  # of 6, i.e. ~61s in total, which spans a whole quota window.
   # Jitter is proportional (up to 25% of the delay) so the ~15 fan-out
   # workers that got rate limited together do not retry in lockstep.
   defp retry_delay(attempt) do
-    base = min(1000 * Integer.pow(2, attempt), 30_000)
-    base + :rand.uniform(max(div(base, 4), 1))
+    base = base_retry_delay(attempt)
+    base + :rand.uniform(max_jitter(base))
   end
+
+  defp max_retry_delay(attempt),
+    do: base_retry_delay(attempt) + max_jitter(base_retry_delay(attempt))
+
+  defp base_retry_delay(attempt), do: min(1000 * Integer.pow(2, attempt), 30_000)
+
+  defp max_jitter(base), do: max(div(base, 4), 1)
 end

@@ -101,8 +101,9 @@ mix test              # full test suite; no live Gmail calls anywhere
 
 - **Scan cap.** A scan fetches at most **10,000 messages** by default
   (newest first). Each scanned message costs one Gmail metadata request, and
-  Gmail's per-user quota works out to roughly 50 requests/second, so 10,000
-  messages take a few minutes. When a scan hits the cap the dashboard shows
+  the default quota of a new Cloud project allows about 1,200 of those per
+  minute (see below), so 10,000 messages take about 9-10 minutes. When a
+  scan hits the cap the dashboard shows
   a warning, since the chart then only reflects the most recent slice.
   Adjust the cap per scan with the **"Max messages"** box in the dashboard
   controls (up to 100,000), or change the default it starts with:
@@ -111,11 +112,23 @@ mix test              # full test suite; no live Gmail calls anywhere
   HERRING_SCAN_MAX=50000 mix herring.serve
   ```
 
-- **Rate limiting.** Google enforces a per-minute quota on top of the
-  per-second one. Large scans can hit it; the app backs off and retries
-  automatically, and if messages still could not be fetched the dashboard
-  shows a warning that the chart is incomplete - wait a minute and scan
-  again.
+- **Rate limiting.** The limit that matters is your Cloud project's Gmail
+  API quota **"Units per minute per user"**, which is 6,000 units on a new
+  project. A metadata fetch costs 5 units, so that is 1,200 messages per
+  minute. Metadata fetches are throttled to 18 per second to stay under it.
+  Going faster does not speed scans up: it uses up the minute's quota early
+  and every request fails until the next minute. If a scan still hits the
+  limit, the app backs off and retries automatically, and if messages still
+  could not be fetched the dashboard shows a warning that the chart is
+  incomplete - wait a minute and scan again.
+
+  If you have raised that quota for your project (Google Cloud console,
+  **IAM & Admin > Quotas**, filter by the Gmail API), raise the throttle to
+  match, at about (quota / 5 / 60) requests per second:
+
+  ```sh
+  HERRING_MAX_RATE=45 mix herring.serve   # e.g. for a 15,000 units/min quota
+  ```
 
 - **Bulk mark-read** applies to at most 10,000 matching messages per click;
   the toast says "at least N" when there may be more, and clicking again

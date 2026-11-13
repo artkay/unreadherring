@@ -22,6 +22,14 @@ if scan_max = System.get_env("HERRING_SCAN_MAX") do
   config :unread_herring, :scan_max, String.to_integer(scan_max)
 end
 
+# Gmail metadata fetches per second (default 18, sized for the default
+# 6,000 units/minute/user quota of a fresh Cloud project). Raise it only if
+# your project's "Units per minute per user" quota has been increased.
+# Tests run unthrottled, so the env var is ignored there.
+if (max_rate = System.get_env("HERRING_MAX_RATE")) && config_env() != :test do
+  config :unread_herring, :gmail_max_rate, String.to_integer(max_rate)
+end
+
 # Bring-your-own OAuth client (Google Cloud "Desktop app" client).
 # Either set these env vars or drop a credentials.json into the config dir
 # (~/.config/unread_herring/) - see the README.

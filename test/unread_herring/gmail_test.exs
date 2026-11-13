@@ -313,6 +313,66 @@ defmodule UnreadHerring.GmailTest do
 
       assert Agent.get(attempts, & &1) == 1
     end
+
+    test "fetch_metadata keeps a message that is rate limited several times before succeeding" do
+      {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+      Req.Test.stub(UnreadHerring.Gmail, fn conn ->
+        if Agent.get_and_update(attempts, &{&1 + 1, &1 + 1}) <= 4 do
+          conn
+          |> Plug.Conn.put_status(403)
+          |> Req.Test.json(%{
+            "error" => %{
+              "code" => 403,
+              "errors" => [%{"domain" => "usageLimits", "reason" => "rateLimitExceeded"}]
+            }
+          })
+        else
+          Req.Test.json(conn, %{
+            "id" => "m1",
+            "labelIds" => ["UNREAD"],
+            "payload" => %{"headers" => [%{"name" => "From", "value" => "a@example.com"}]}
+          })
+        end
+      end)
+
+      retrying_opts = [
+        token: @token,
+        req_options: [plug: {Req.Test, UnreadHerring.Gmail}, retry_delay: fn _n -> 1 end]
+      ]
+
+      assert {:ok, [%{id: "m1", from: "a@example.com"}]} =
+               Gmail.fetch_metadata(["m1"], retrying_opts)
+
+      assert Agent.get(attempts, & &1) == 5
+    end
+
+    test "metadata task timeout outlasts the worst-case retry backoff" do
+      # 1s + 2s + 4s + 8s + 16s + 30s (capped), each with up to 25% jitter.
+      # A timeout below this kills tasks mid-backoff and silently drops
+      # their messages.
+      worst_case_backoff = round((1 + 2 + 4 + 8 + 16 + 30) * 1000 * 1.25)
+
+      assert Gmail.metadata_timeout(6) > worst_case_backoff
+      assert Gmail.metadata_timeout(0) > 0
+    end
+
+    test "fetch_metadata throttles total throughput to max_rate" do
+      Req.Test.stub(UnreadHerring.Gmail, fn conn ->
+        id = conn.request_path |> String.split("/") |> List.last()
+        Req.Test.json(conn, %{"id" => id, "labelIds" => [], "payload" => %{"headers" => []}})
+      end)
+
+      ids = for n <- 1..6, do: "m#{n}"
+
+      # 2 workers at 20 req/s => each task takes at least 100ms, so 6 ids
+      # need at least 3 rounds (~300ms). Unthrottled stubs finish in ~1ms.
+      {elapsed_us, {:ok, messages}} =
+        :timer.tc(fn -> Gmail.fetch_metadata(ids, opts(max_concurrency: 2, max_rate: 20)) end)
+
+      assert length(messages) == 6
+      assert elapsed_us >= 290_000
+    end
   end
 
   describe "get_profile/1" do
