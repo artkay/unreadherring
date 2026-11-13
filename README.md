@@ -121,6 +121,35 @@ mix test              # full test suite; no live Gmail calls anywhere
   the toast says "at least N" when there may be more, and clicking again
   continues where it left off.
 
+## Troubleshooting
+
+### The page loads unstyled on macOS (no CSS)
+
+The CSS in `priv/static/assets/css/app.css` is built by a standalone
+Tailwind binary that the `tailwind` hex package downloads into `_build/`.
+On some macOS setups the downloaded binary has an invalid code signature, so
+macOS kills it immediately (exit code 137, `Killed: 9`). The dev watcher
+dies without an error, so the page renders as plain unstyled HTML while
+JavaScript still works.
+
+To confirm:
+
+```sh
+codesign --verify _build/tailwind-macos-*
+# _build/tailwind-macos-arm64-4.3.0: invalid signature (code or signature have been modified)
+```
+
+To fix it, re-sign the binary ad-hoc, build the CSS, and restart the server:
+
+```sh
+codesign --force --sign - _build/tailwind-macos-*
+mix tailwind unread_herring
+mix herring.serve
+```
+
+Run the `codesign` step again whenever the binary is downloaded again (for
+example after deleting `_build/`).
+
 ## Privacy model
 
 - Every user is their own Google Cloud "app", in Testing mode, scoped to
